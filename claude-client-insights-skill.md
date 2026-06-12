@@ -2,7 +2,7 @@
 name: "client-insights"
 description: "Client intelligence skill for Cumulus FSC. Two modes: (1) INDIVIDUAL CLIENT PROFILE — use when the user asks about a specific named person (\"tell me about Rachel Adams\", \"show me John's portfolio\", \"what's [name]'s profile/assets/risk/goals\") — looks up full 360 profile: demographics, income, AUM across all account types, financial goals, attrition risk, email/web engagement, cases, and CRM opportunities. (2) SEGMENT & POPULATION ANALYTICS — use when the user asks aggregate questions about customer populations (\"how many affluent clients in California\", \"show me clients over 65\", \"what are our top segments\", \"clients with assets over $1M\") — queries Data Cloud DMOs directly without requiring a segment. Invoke this skill proactively for ANY question about a client or group of clients."
 author: "Viral Patel"
-version: "2.0.0"
+version: "2.0.1"
 date: "2026-06-10"
 comment: "Unified client intelligence skill. v2 adds individual client profile mode (CRM + Data Cloud 360 lookup) on top of v1 population/segment analytics."
 ---
@@ -11,6 +11,12 @@ comment: "Unified client intelligence skill. v2 adds individual client profile m
 
 ## Execution behavior — CRITICAL
 **Work silently.** Do not narrate, explain, or describe what you are doing between queries. Do not say things like "Now I'll fetch...", "Let me try...", "I found X, so next I'll...". Execute all queries without commentary and output ONLY the final formatted card. The user sees tool call indicators automatically — do not add text narration on top of them.
+
+**When queries fail or return 0 results, work around it silently.** Never surface technical failure reasons in output. Specifically:
+- If a cross-DMO semi-join returns 0 results, skip that filter and report the dimensions separately (e.g. population count from Individual DMO + attrition stats from Attrition DMO)
+- If a DMO is inaccessible or a field is missing, omit that section silently
+- Never write phrases like "semi-join doesn't resolve", "Data Cloud configuration", "org limitation", "this relationship doesn't work", or any explanation of why data is unavailable
+- The `⚠ Data notes` footer must only list field coverage gaps (e.g. "income data ~25% populated") — never mention query failures, infrastructure issues, or workarounds applied
 
 ---
 
@@ -72,11 +78,11 @@ LIMIT 1
 
 ---
 
-### Step 3 — Remaining Data Cloud & CRM Enrichment
+### Step 3A — Lead Card Queries (ALWAYS run on first invocation)
 
-Run all queries using the `Contact_EID__c` resolved in Step 2. If a DMO returns no rows, skip that section in the output card silently.
+Run these 6 queries only. Do NOT run Step 3B queries on first invocation.
 
-#### 3a — Attrition Risk & Pre-computed Summary (Data Cloud)
+#### 3A-a — Attrition + pre-computed summary
 ```sql
 SELECT YearlyIncome__c, Attrited_prediction__c,
        Goa_Has_Goals__c, Goa_Number_of_Goals__c,
@@ -89,7 +95,56 @@ WHERE Contact_EID__c = '[Contact_EID__c]'
 LIMIT 1
 ```
 
-#### 3b — Investment Accounts (Data Cloud)
+#### 3A-b — Investment total (aggregate only)
+```sql
+SELECT SUM(balance__c)
+FROM Account_Investment__dlm
+WHERE customer_id__c = '[Contact_EID__c]'
+```
+
+#### 3A-c — Deposit total (aggregate only)
+```sql
+SELECT SUM(balance__c)
+FROM Account_Deposit__dlm
+WHERE customer_id__c = '[Contact_EID__c]'
+```
+
+#### 3A-d — Loan total (aggregate only)
+```sql
+SELECT SUM(balance__c)
+FROM Account_Loan__dlm
+WHERE customer_id__c = '[Contact_EID__c]'
+```
+
+#### 3A-e — Open cases (most recent 3)
+```sql
+SELECT ssot__Subject__c, ssot__CaseStatusId__c, ssot__Origin__c, ssot__CreatedDate__c
+FROM ssot__Case__dlm
+WHERE Contact_EID__c = '[Contact_EID__c]'
+AND ssot__IsClosed__c = 'false'
+ORDER BY ssot__CreatedDate__c DESC NULLS LAST
+LIMIT 3
+```
+
+#### 3A-f — Open opportunities (CRM — uses CRM Contact Id from Step 1)
+```sql
+SELECT Id, Name, StageName, Amount, CloseDate
+FROM Opportunity
+WHERE Id IN (
+  SELECT OpportunityId FROM OpportunityContactRole WHERE ContactId = '[CRM Contact Id from Step 1]'
+)
+AND IsClosed = false
+ORDER BY CloseDate ASC NULLS LAST
+LIMIT 5
+```
+
+---
+
+### Step 3B — Detail Queries (ONLY run when user explicitly asks for more)
+
+Trigger phrases: "show me more", "full profile", "show accounts", "show goals", "show engagement", "show cases", "show opportunities", or any specific follow-up question about account details.
+
+#### 3B-a — Investment account rows
 ```sql
 SELECT account_id__c, name__c, balance__c, status__c, type__c,
        risk_tolerance__c, tax_status__c, goals__c, open_date__c
@@ -98,7 +153,7 @@ WHERE customer_id__c = '[Contact_EID__c]'
 ORDER BY balance__c DESC NULLS LAST
 ```
 
-#### 3c — Deposit / Savings Accounts (Data Cloud)
+#### 3B-b — Deposit account rows
 ```sql
 SELECT account_id__c, name__c, balance__c, status__c, type__c,
        interest_rate__c, open_date__c
@@ -106,7 +161,7 @@ FROM Account_Deposit__dlm
 WHERE customer_id__c = '[Contact_EID__c]'
 ```
 
-#### 3d — Loans & Mortgages (Data Cloud)
+#### 3B-c — Loan rows
 ```sql
 SELECT account_id__c, name__c, balance__c, status__c, type__c,
        interest_rate__c, minimum_payment__c, payment__c, term__c, due_date__c
@@ -114,7 +169,7 @@ FROM Account_Loan__dlm
 WHERE customer_id__c = '[Contact_EID__c]'
 ```
 
-#### 3e — Credit Cards (Data Cloud)
+#### 3B-d — Credit cards
 ```sql
 SELECT account_id__c, name__c, balance__c, status__c, type__c,
        available_credit__c, monthly_purchase_volume__c,
@@ -123,7 +178,7 @@ FROM Account_Credit_Card__dlm
 WHERE customer_id__c = '[Contact_EID__c]'
 ```
 
-#### 3f — Insurance Policies (Data Cloud)
+#### 3B-e — Insurance policies
 ```sql
 SELECT account_id__c, name__c, status__c, type__c,
        coverage_amount__c, premium_amount__c, renewal_date__c, open_date__c
@@ -131,7 +186,7 @@ FROM Account_Policy__dlm
 WHERE customer_id__c = '[Contact_EID__c]'
 ```
 
-#### 3g — Financial Goals (Data Cloud)
+#### 3B-f — Financial goals
 ```sql
 SELECT goal_id__c, name__c, type__c, status__c,
        targetvalue__c, currentvalue__c, GOAL_DELTA_VALUE__c, date__c
@@ -140,7 +195,7 @@ WHERE customer_id__c = '[Contact_EID__c]'
 ORDER BY date__c DESC NULLS LAST
 ```
 
-#### 3h — Email Engagement — last 5 (Data Cloud)
+#### 3B-g — Email engagement (last 5)
 ```sql
 SELECT engagement_date__c, engagement_type__c, email_name__c,
        email_subject_line__c, channel__c
@@ -150,7 +205,7 @@ ORDER BY engagement_date__c DESC NULLS LAST
 LIMIT 5
 ```
 
-#### 3i — Web Engagement — last 5 sessions (Data Cloud)
+#### 3B-h — Web engagement (last 5 sessions)
 ```sql
 SELECT session_date__c, category_viewed__c, device_category__c,
        device_os_name__c, browser__c, session_duration__c, page_views__c
@@ -160,7 +215,7 @@ ORDER BY session_date__c DESC NULLS LAST
 LIMIT 5
 ```
 
-#### 3j — Service Cases (Data Cloud)
+#### 3B-i — All cases
 ```sql
 SELECT ssot__Subject__c, ssot__CaseStatusId__c, ssot__CaseTypeId__c,
        ssot__IsClosed__c, ssot__CreatedDate__c, ssot__ClosedDateTime__c,
@@ -171,7 +226,7 @@ ORDER BY ssot__CreatedDate__c DESC NULLS LAST
 LIMIT 10
 ```
 
-#### 3k — Opportunities (CRM — uses CRM Contact Id from Step 1, not EID)
+#### 3B-j — All opportunities (CRM)
 ```sql
 SELECT Id, Name, StageName, Amount, CloseDate, Type, LeadSource,
        Probability, IsClosed, IsWon
@@ -185,83 +240,47 @@ LIMIT 10
 
 ---
 
-### Step 4 — Client Profile Output Card
+### Step 4 — Output
 
-Render as a structured markdown card. Only include sections where data was returned. Compute total AUM = sum of all investment + deposit account balances. Show loan balances as liabilities separately.
+#### First invocation — Lead Card only
+
+Compute AUM = sum of investment + deposit balances. Liabilities = sum of loan balances. **Omit any line silently where data is null.**
 
 ```
-## [Full Name] — Client Profile
-*CRM Contact · [Title] · [Account Name]*
+## [Full Name] — Client Snapshot
+Age [X] · Income $[X] · [City, ST]
+AUM $[X] ([Wealth Tier]) · Liabilities $[X]
+Attrition [X]% — [Low / Medium / High Risk] · Top driver: [Predictor_1_Name]
+Product interest: [Product_Interest__c] · [Product_Category_Interest__c]
 
-### Identity
-| Field | Value |
-|---|---|
-| **Age** | X (DOB: YYYY-MM-DD) |
-| **Location** | City, ST ZIP |
-| **Income** | $X (source: Attrition DMO or Individual DMO) |
-| **Gender** | X |
-| **Life Events** | X |
-| **Product Interest** | X |
-| **Customer Since** | ~X years (X days tenure) |
+[Only if open opps exist:] Open opportunities ([N]): [Opp Name] — [Stage] (closes [CloseDate]) …
+[Only if open cases exist:] Open cases ([N]): [Subject] — [Status] …
 
-### Financial Snapshot
-| Metric | Value |
-|---|---|
-| **Total AUM (Invest + Deposit)** | $X |
-| **Total Loan Liabilities** | $X |
-| **Net Position** | $X |
-| **Attrition Risk** | X% — [Low / Medium / High Risk] |
-| **Top Risk Predictor** | [Predictor_1_Name]: [Predictor_1_Value] |
-
-### Investment Accounts  *(N accounts)*
-| Account | Type | Balance | Risk Tolerance | Tax Status | Status |
-|---|---|---|---|---|---|
-| [name] | [type] | $X | [risk] | [tax] | [status] |
-
-### Deposit / Savings Accounts  *(N accounts)*
-| Account | Type | Balance | Rate | Status |
-|---|---|---|---|---|
-
-### Loans & Mortgages  *(N accounts)*
-| Account | Type | Balance | Rate | Payment | Due | Status |
-|---|---|---|---|---|---|---|
-
-### Credit Cards  *(N accounts)*
-| Account | Balance | Available Credit | Monthly Volume | Points | Rate |
-|---|---|---|---|---|---|
-
-### Insurance Policies  *(N policies)*
-| Policy | Type | Coverage | Premium | Renewal | Status |
-|---|---|---|---|---|---|
-
-### Financial Goals  *(N goals)*
-| Goal | Type | Target | Current | Gap | Status |
-|---|---|---|---|---|---|
-| [name] | [type] | $X | $X | $X | [status] |
-
-### Email Engagement  *(last 5)*
-| Date | Type | Campaign | Subject |
-|---|---|---|---|
-
-### Web Engagement  *(last 5 sessions)*
-| Date | Category Viewed | Device | Duration | Pages |
-|---|---|---|---|---|
-
-### Service Cases  *(N total)*
-| Subject | Type | Status | Origin | Opened | Closed |
-|---|---|---|---|---|---|
-
-### Opportunities  *(N total)*
-| Opportunity | Stage | Amount | Close Date | Won? |
-|---|---|---|---|---|
-
-⚠ *Data notes: [null fields skipped, proxy substitutions, date caveats]*
+**Key signals:** [2–3 sentence synthesis of the most actionable signals from the data above —
+e.g. tenure, attrition risk, open issues, product interest alignment with open opps.]
 ```
+*Ask for accounts, goals, engagement, cases, or opportunities.*
+
+**Key signals rules:**
+- Always include — synthesize what matters most for a client conversation
+- Draw from: tenure (`Ten_OPEN_DATE_formula__c`), AUM tier, attrition risk + top driver, open cases, open opps, product interest
+- Write in plain business language — no field names, no technical jargon
+- 2–3 sentences max; lead with the most actionable signal
+
+**Other line rules:**
+- Line 1 (age/income/location): income from Attrition DMO (`YearlyIncome__c`) as primary, Individual DMO as fallback; omit if both null
+- Line 2 (AUM): wealth tier — Starter ≤$100K, Growth $100K–$500K, Affluent >$500K; omit liabilities if no loans
+- Line 3 (attrition): score 0–100, show as percentage; omit if no attrition record
+- Line 4 (product interest): omit if null
+- Opp/case lines: show count + up to 3 items inline; omit entirely if none open
+
+#### On follow-up (user asks for more detail)
+
+Run the relevant Step 3B queries and render the appropriate detail tables (investment accounts, deposits, loans, credit cards, insurance, goals, email engagement, web engagement, full cases, full opportunities). Only run and render what was asked for — not all sections at once unless "full profile" was requested.
 
 **Edge cases:**
-- If no Data Cloud record exists → show CRM data + note "No Data Cloud profile found"
-- If no financial accounts → show identity + note "No financial accounts found in Data Cloud"
-- Null/missing fields → skip the cell or row, note in data notes at bottom
+- No Data Cloud profile → show name/CRM title/account + note "No Data Cloud profile found"
+- No financial accounts → show identity lines + note "No financial accounts found in Data Cloud"
 
 ---
 
@@ -301,7 +320,7 @@ Trigger this mode when the user asks **aggregate questions** about customer popu
 Join: `Contact_EID__c` = `ssot__Individual__dlm.Contact_EID__c`
 - `Contact_EID__c` — join key
 - `YearlyIncome__c` — yearly income (more reliably populated than Individual)
-- `Attrited_prediction__c` — attrition probability (0.0–1.0; > 0.5 = at-risk)
+- `Attrited_prediction__c` — attrition score (0–100 scale; > 60 = high risk, avg ~18, min 0.01, max 99.58)
 - `Goa_Has_Goals__c` — has financial goals (string 'true'/'false')
 - `Goa_Number_of_Goals__c` — count of goals
 - `Tra_Number_of_Accounts__c` — total number of accounts across all types
@@ -435,10 +454,11 @@ Based on ~1M records with populated income:
 - Data stats: Min $55,000 | Avg $176,114 | Max $724,998
 
 ### Attrition Risk Tiers
-Based on `Attrition_Prediction_With_Predictors__dlm.Attrited_prediction__c`:
-- **Low Risk**: < 0.3
-- **Medium Risk**: 0.3–0.6
-- **High Risk**: > 0.6
+Based on `Attrition_Prediction_With_Predictors__dlm.Attrited_prediction__c` (0–100 scale):
+- **Low Risk**: < 30
+- **Medium Risk**: 30–60
+- **High Risk**: > 60
+- Data stats: Min 0.01 | Avg 18.48 | Max 99.58 | ~117,703 high-risk clients total
 
 ---
 
@@ -480,7 +500,7 @@ SOQL semi-joins on Data Cloud only work on actual SF Id fields — NOT on `custo
 | Loan | `WHERE Id IN (SELECT rel_1701140419594_end__c FROM Account_Loan__dlm WHERE ...)` |
 | Policy | `WHERE Id IN (SELECT rel_1701140512864_end__c FROM Account_Policy__dlm WHERE ...)` |
 | Financial goal | `WHERE Id IN (SELECT rel_1702398179937_end__c FROM Financial_Goal__dlm WHERE ...)` |
-| Attrition | `WHERE Id IN (SELECT rel_1719004647580_end__c FROM Attrition_Prediction_With_Predictors__dlm WHERE ...)` |
+| Attrition | `WHERE Id IN (SELECT rel_1719004647580_end__c FROM Attrition_Prediction_With_Predictors__dlm WHERE ...)` — **⚠ known broken in this org: always returns 0. Do NOT use. See fallback below.** |
 | Email engagement | `WHERE Id IN (SELECT rel_1701196151061_end__c FROM Email_Engagement__dlm WHERE ...)` |
 | Web engagement | `WHERE Id IN (SELECT rel_1701194920482_end__c FROM Web_Engagement__dlm WHERE ...)` |
 
@@ -497,34 +517,45 @@ AND Id IN (
 )
 ```
 
+### Attrition + geography/age queries — required fallback pattern
+Because the attrition semi-join (`rel_1719004647580_end__c`) is non-functional in this org, **never attempt to filter `ssot__Individual__dlm` by attrition score**. Instead, always report both dimensions in parallel with no commentary:
+
+1. **Population query**: Count/profile the Individual population by the requested geography/age filters
+2. **Attrition profile query**: Count high-risk clients (`Attrited_prediction__c > 60`) from `Attrition_Prediction_With_Predictors__dlm` filtered to the same geography via `Address_State_Prov__c` or `Age__c` if available, otherwise org-wide
+
+Present both results side by side in the output card as "Population" and "High-Risk Profile" sections. Do not mention why they are separate or that a join was attempted.
+
 ### Pagination limits
-Data Cloud DMOs enforce an OFFSET maximum of 2,000 rows per query. **Never page through IDs or sample-and-extrapolate.** If a question requires cross-DMO filtering that cannot be expressed as a semi-join or aggregate, report the individual counts from each DMO separately and note the limitation in the data notes section.
+Data Cloud DMOs enforce an OFFSET maximum of 2,000 rows per query. **Never page through IDs or sample-and-extrapolate.** If a question requires cross-DMO filtering that cannot be expressed as a semi-join or aggregate, report the individual counts from each DMO separately — never explain why in the output.
 
 ---
 
 ## Population Analytics Output Format (Mode 2)
 
-Always render results as a structured demographic card using markdown. Match the depth of response to the question asked. Sample structure:
+Render a compact lead card. **Lead with what directly answers the question, then 2–3 standout signals.** No breakdowns, distributions, or full tables unless the user asks.
 
 ```
-## [Query Title] — demographic analysis
-*Data Cloud · [DMOs queried] · [N] records matched*
+## [Query Title]
 
-| TOTAL MEMBERS | AVG AGE | AVG INV. BALANCE | TOP STATE |
+| POPULATION | AVG AGE | DOMINANT WEALTH TIER | HIGH-RISK PROFILE |
 |---|---|---|---|
-| [N] | [X] | $[X] | [ST] · [ST] |
+| [N] | [X] | [Tier] ([X]%) | [N] clients · Avg score [X] |
 
-### Age Distribution  *(N=X with age data)*
-...
-
-### Wealth Tiers — Investment Balance Proxy
-...
-
-### Top 5 States / Cities
-...
-
-⚠ *Data notes: [caveats about null fields, coverage gaps, date staleness, proxies used]*
+Top states: [ST] [N] · [ST] [N] · [ST] [N]
+Top predictor: [most common Predictor_1_Name across high-risk segment]
 ```
+*Ask for wealth breakdown, engagement details, or top predictors.*
+
+**Column rules:**
+- POPULATION: total count from `ssot__Individual__dlm` matching the query filters
+- AVG AGE: `AVG(Age__c)` from same population; omit column if age data sparse
+- DOMINANT WEALTH TIER: the tier (Starter/Growth/Affluent) with the highest count and its percentage; use investment balance tiers
+- HIGH-RISK PROFILE: count with `Attrited_prediction__c > 60` from Attrition DMO for same geography/age band; if attrition semi-join is unavailable, show org-wide high-risk count with no explanation
+- Top states: top 3 states by count (omit if query was already scoped to one state)
+- Top predictor: most frequent `Predictor_1_Name__c` value among high-risk records; omit if attrition data unavailable
+- If user asks for more detail, output full breakdowns: age distribution, all wealth tiers, state table, engagement stats, attrition distribution
+
+**⚠ Data notes footer:** only include if field coverage is notably sparse (e.g. income <25% populated). Never mention query mechanics, semi-joins, or workarounds.
 
 ---
 
